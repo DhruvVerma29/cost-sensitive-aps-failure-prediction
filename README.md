@@ -1,36 +1,34 @@
-# ATM Cash Demand Forecasting & Replenishment Optimisation
+# APS Failure Cost Optimisation (Scania Trucks)
 
-An end-to-end forecasting-to-optimisation pipeline for ATM cash logistics. A seasonal time-series model forecasts the next 7 days of cash withdrawals at an ATM, and a mixed-integer linear program (MILP) uses those forecasts to decide **when to send a cash truck and how much to deliver**, at minimum total holding and dispatch cost.
+A cost-sensitive machine-learning pipeline that predicts failures of the Air Pressure System (APS) in heavy Scania trucks and chooses the decision threshold that minimises total maintenance cost. Instead of optimising accuracy, the model is built and evaluated against the real business cost of each type of mistake.
 
 ---
 
-## Overview
+## Problem
 
-Cash logistics is a trade-off: stocking too much cash is costly to hold, while stocking too little risks the ATM running dry. This project connects the two halves of the decision:
+Each truck record contains anonymised sensor readings. The goal is to flag trucks whose APS component is about to fail.
 
-1. **Predict** – a SARIMAX model forecasts daily withdrawals and produces a 95% upper bound for each day, so the plan is built against a high-demand scenario.
-2. **Optimise** – a MILP chooses the delivery schedule that covers that demand at the lowest cost, subject to ATM and truck capacity.
+| Outcome | Meaning | Cost |
+|---|---|---|
+| False positive (FP) | A healthy truck is sent for an unnecessary check | **10** |
+| False negative (FN) | A failing truck is missed | **500** |
+
+The objective is to minimise **total cost = 10 · FP + 500 · FN**.
 
 ---
 
 ## Dataset
 
-The project uses `transactions_in_usd.csv`, a daily record of withdrawals for five ATMs (Big Street, Mount Road, Airport, KK Nagar and Christ College).
+Fetch the dataset at https://archive.ics.uci.edu/dataset/421/aps+failure+at+scania+trucks
 
-| Column | Description |
-|---|---|
-| `ATM Name` | ATM identifier |
-| `Transaction Date` | Date of the record |
-| `No Of Withdrawals` | Number of withdrawals |
-| `No Of XYZ Card Withdrawals`, `No Of Other Card Withdrawals` | Withdrawals split by card type |
-| `Total amount Withdrawn` | Total cash withdrawn (USD) |
-| `Amount withdrawn XYZ Card`, `Amount withdrawn Other Card` | Amount split by card type |
-| `Weekday` | Day of the week |
-| `Festival Religion` | Festival indicator |
-| `Working Day` | Working day / holiday flag |
-| `Holiday Sequence` | Position in a holiday sequence |
+Download and place these two files in the project folder:
 
-This project models the **Airport ATM** using `Total amount Withdrawn`.
+```
+aps_failure_training_set.csv
+aps_failure_test_set.csv
+```
+
+Each file has a `class` column (`pos` = APS failure, `neg` = other component failure) and 170 anonymised numeric sensor features. Missing values are encoded as `na`.
 
 ---
 
@@ -38,8 +36,12 @@ This project models the **Airport ATM** using `Total amount Withdrawn`.
 
 ```
 .
-├── Proj.py                    # Full pipeline: data prep, forecasting, optimisation, plot
-├── transactions_in_usd.csv    # ATM transaction data
+├── aps_cost_optimization.py        # Full pipeline
+├── aps_failure_training_set.csv    # Training data (from UCI)
+├── aps_failure_test_set.csv        # Official test data (from UCI)
+├── results.csv                     # Generated: cost comparison table
+├── cost_curve.png                  # Generated: cost vs threshold
+├── feature_importance.png          # Generated: top 25 features
 └── README.md
 ```
 
@@ -47,51 +49,47 @@ This project models the **Airport ATM** using `Total amount Withdrawn`.
 
 ## Pipeline
 
-### Phase 1 – Data engineering
-- Filters the data to the Airport ATM and sorts it chronologically.
-- Uses the continuous block from 2015-01-01 to 2017-12-09 and reindexes it to a daily frequency.
-- Fills any missing days in `Total amount Withdrawn` with time-based interpolation.
-- Derives calendar features from the timestamp: day name, weekend flag, and a working-day (`W`) / holiday (`H`) indicator used as an exogenous regressor.
-- Runs an **Augmented Dickey-Fuller test** on the weekly-differenced series to confirm stationarity after seasonal differencing (`D = 1`).
+### 1. Missing-value handling
+- Missingness is computed on the **training set only**.
+- Features with more than 70% missing values are dropped.
+- No imputation is applied: the histogram-based gradient boosting model routes missing values to the best side of every split, so the fact that a value is missing is kept as a signal.
 
-### Phase 2 – SARIMAX forecasting
-- **Model:** `SARIMAX(1, 0, 1)(1, 1, 1, 7)` with the working-day indicator as an exogenous variable.
-  - Non-seasonal part: `d = 0`
-  - Seasonal part: `D = 1`, period `s = 7` to capture the weekly cycle
-- Builds future exogenous values for the next 7 days from the actual calendar.
-- Forecasts 7 days ahead and takes the **upper bound of the 95% confidence interval** as the planning demand for each day.
+### 2. Class imbalance via cost-sensitive learning
+- Failures are up-weighted in the loss with `pos_weight = (# negatives) / (# positives)`.
+- No synthetic rows or resampling (no SMOTE) are used; the original data distribution is preserved.
 
-### Phase 3 – MILP optimisation (PuLP)
-Minimises total cost over the 7-day horizon.
+### 3. Feature selection
+- A model is trained on 75% of the training data and **permutation importance** (scored by average precision) is measured on the remaining 25%.
+- The top 50% of features by importance are kept.
 
-**Decision variables**
-- `x[t]` – cash delivered on day `t` (continuous, ≥ 0)
-- `y[t]` – whether a truck is dispatched on day `t` (binary)
-- `I[t]` – end-of-day inventory on day `t` (continuous, ≥ 0)
+### 4. Threshold selection
+- 5-fold stratified cross-validation produces **out-of-fold probabilities** on the training set.
+- A sweep of thresholds from 0.01 to 0.99 is evaluated with the 10/500 cost function, and the threshold with the lowest cost is selected.
 
-**Objective**
+### 5. Final evaluation
+- The final model is fit on the full training set and evaluated once on the official test set.
+- Results are compared across four settings:
+  - Selected-feature model at the default 0.5 threshold
+  - All-feature model at the default 0.5 threshold
+  - Selected-feature model at the cross-validated threshold
+  - Reference: threshold chosen with knowledge of the test set (oracle)
+- A naive baseline that never flags a truck is reported for context.
 
-```
-minimise  Σ_t ( holding_cost_rate · I[t]  +  truck_dispatch_cost · y[t] )
-```
+---
 
-**Constraints**
-- Inventory balance: `I[t] = I[t-1] + x[t] − forecasted_demand[t]` (starting from the initial inventory)
-- ATM capacity: `I[t] ≤ max_atm_capacity`
-- Truck capacity and linking: `x[t] ≤ max_truck_capacity · y[t]`
+## Model
 
-**Parameters**
+`HistGradientBoostingClassifier` (scikit-learn) with:
 
 | Parameter | Value |
 |---|---|
-| Holding cost rate | 5% per year (applied daily) |
-| Truck dispatch cost | $150 per trip |
-| ATM capacity | $150,000 |
-| Truck capacity | $50,000 |
-| Initial inventory | $5,000 |
+| `max_iter` | 300 |
+| `learning_rate` | 0.05 |
+| `max_leaf_nodes` | 31 |
+| `min_samples_leaf` | 20 |
+| `l2_regularization` | 1.0 |
 
-### Phase 4 – Visualisation
-Plots the forecasted peak demand as bars and end-of-day inventory as a line, with arrows marking the days a truck arrives and the amount delivered.
+An equivalent XGBoost configuration is `XGBClassifier(scale_pos_weight=pos_weight, tree_method="hist")`.
 
 ---
 
@@ -100,45 +98,45 @@ Plots the forecasted peak demand as bars and end-of-day inventory as a line, wit
 ### 1. Install dependencies
 
 ```bash
-pip install pandas numpy matplotlib statsmodels pulp
+pip install numpy pandas matplotlib scikit-learn
 ```
 
-### 2. Run
+### 2. Add the data
+Download the two CSV files from the UCI link above into the project folder.
+
+### 3. Run
 
 ```bash
-python Proj.py
+python aps_cost_optimization.py
 ```
-
-Make sure `transactions_in_usd.csv` is in the same folder as `Proj.py`.
 
 ---
 
-## Output
+## Outputs
 
-The script prints:
-- The ADF test statistic and p-value for the weekly-differenced series
-- The 7-day demand risk bounds
-- The optimal delivery schedule: delivery amount, end-of-day inventory and whether a truck is sent, for each day
-- The total minimum cost
+| File | Description |
+|---|---|
+| `results.csv` | Threshold, FP, FN, TP, TN, total cost and accuracy for each setting |
+| `cost_curve.png` | Total cost against probability threshold on the test set, with the train out-of-fold curve, the chosen threshold and the 0.5 default (linear and log scale) |
+| `feature_importance.png` | Top 25 features by permutation importance |
 
-It then displays the cash routing chart for the 7-day plan.
+The console output also reports the share of rows containing missing values, the dropped features, the class weight, the kept features with the top 10 ranked, the chosen threshold and the full comparison table.
 
 ---
 
 ## Tech stack
 
 - **Python**
-- **pandas / NumPy** – data handling and calendar features
-- **statsmodels** – ADF test and SARIMAX forecasting
-- **PuLP** – mixed-integer linear programming
-- **Matplotlib** – visualisation
+- **pandas / NumPy** – data handling
+- **scikit-learn** – gradient boosting, cross-validation, permutation importance, metrics
+- **Matplotlib** – cost curve and feature-importance plots
 
 ---
 
 ## Key concepts
 
-- **Seasonal time-series modelling** with weekly seasonality and exogenous calendar regressors
-- **Stationarity testing** with the Augmented Dickey-Fuller test
-- **Prediction-interval-based planning**, using the 95% upper bound as a risk-aware demand
-- **Mixed-integer linear programming** with fixed-charge (truck dispatch) costs and capacity constraints
-- **Predict-then-optimise** workflow linking forecasting directly to an operational decision
+- **Cost-sensitive learning** with class weights in place of resampling
+- **Native missing-value handling** in tree models
+- **Permutation importance** for feature selection
+- **Out-of-fold threshold tuning** against an asymmetric business cost
+- **Leakage-free evaluation**: every choice (dropped features, selected features, threshold) is made on training data only, and the test set is scored once
